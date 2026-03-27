@@ -6,3 +6,4 @@ usage-log.json
 bot.log
 .bot.lock
 system-prompt.md
+.DS_Store
