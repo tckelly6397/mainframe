@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, Partials, AttachmentBuilder, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, AttachmentBuilder, EmbedBuilder, ChannelType, PermissionFlagsBits } = require('discord.js');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -15,8 +15,8 @@ const CLAUDE_PATH = process.env.CLAUDE_PATH || (() => {
 const APPS_DIR = process.env.APPS_DIR || path.join(HOME_DIR, 'apps');
 const BOT_OWNER = process.env.BOT_OWNER || 'the owner';
 const SERVER_NAME = process.env.SERVER_NAME || 'server';
-const MAIN_CHANNEL_ID = process.env.MAIN_CHANNEL_ID || '';
-const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID || '';
+const GUILD_ID = process.env.GUILD_ID || '';
+const CATEGORY_ID = process.env.CATEGORY_ID || '';
 const MAX_MESSAGE_LENGTH = 2000;
 const SESSION_FILE = path.join(__dirname, 'sessions.json');
 const USAGE_LOG_FILE = path.join(__dirname, 'usage-log.json');
@@ -395,6 +395,58 @@ async function compactSession(threadId, channel) {
   return { oldPct, newPct };
 }
 
+// ─── Smart channel routing ───────────────────────────────────────────
+
+const UTILITY_CHANNELS = new Set(['general', 'dev', 'logs']);
+
+async function findBestChannel(guild, prompt, currentChannelId) {
+  try {
+    await guild.channels.fetch();
+    const projectChannels = guild.channels.cache.filter(c =>
+      c.parentId === CATEGORY_ID &&
+      c.type === ChannelType.GuildText &&
+      !c.name.startsWith('──') &&
+      !UTILITY_CHANNELS.has(c.name)
+    );
+
+    const promptLower = prompt.toLowerCase().replace(/-/g, ' ');
+    let bestChannel = null;
+    let bestScore = 0;
+
+    for (const [, ch] of projectChannels) {
+      if (ch.id === currentChannelId) continue;
+      const normalizedName = ch.name.toLowerCase().replace(/-/g, ' ');
+      let score = 0;
+      if (promptLower.includes(normalizedName)) {
+        score += normalizedName.length * 2;
+      } else {
+        for (const part of normalizedName.split(/\s+/).filter(p => p.length >= 3)) {
+          if (promptLower.includes(part)) score += part.length;
+        }
+      }
+      if (ch.topic) {
+        for (const word of ch.topic.toLowerCase().split(/\s+/).filter(w => w.length >= 5)) {
+          if (promptLower.includes(word)) score += 1;
+        }
+      }
+      if (score > bestScore) { bestScore = score; bestChannel = ch; }
+    }
+    return bestScore >= 4 ? bestChannel : null;
+  } catch (e) {
+    log('error', 'findBestChannel failed', { error: e.message });
+    return null;
+  }
+}
+
+async function createChannelInCategory(guild, name, topic = null) {
+  return guild.channels.create({
+    name: name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, ''),
+    type: ChannelType.GuildText,
+    parent: CATEGORY_ID,
+    ...(topic ? { topic } : {}),
+  });
+}
+
 // ─── Discord client ──────────────────────────────────────────────────
 
 const client = new Client({
@@ -408,13 +460,70 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message, Partials.Reaction],
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
   log('info', `Logged in as ${client.user.tag}`);
+
+  // ─── Auto-configure heartbeat to #logs channel ───
+  if (CATEGORY_ID && GUILD_ID && !S('heartbeat_channel')) {
+    try {
+      const guild = client.guilds.cache.get(GUILD_ID);
+      if (guild) {
+        await guild.channels.fetch();
+        const logsChannel = guild.channels.cache.find(
+          c => c.parentId === CATEGORY_ID && c.name === 'logs'
+        );
+        if (logsChannel) {
+          settings.heartbeat_channel = logsChannel.id;
+          saveSettings();
+          log('info', `Auto-configured heartbeat → #logs (${logsChannel.id})`);
+        }
+      }
+    } catch (e) {
+      log('error', 'Failed to auto-configure heartbeat', { error: e.message });
+    }
+  }
+
+  // ─── Startup message in #general ───
+  if (CATEGORY_ID && GUILD_ID) {
+    try {
+      const guild = client.guilds.cache.get(GUILD_ID);
+      if (guild) {
+        await guild.channels.fetch();
+        const generalChannel = guild.channels.cache.find(
+          c => c.parentId === CATEGORY_ID && c.name === 'general'
+        );
+        if (generalChannel) {
+          await generalChannel.send({
+            embeds: [new EmbedBuilder()
+              .setColor(COLOR_SUCCESS)
+              .setTitle('Online')
+              .setDescription('Ready. Talk to me in any channel here — I\'ll route to the right place.')
+              .setTimestamp()]
+          });
+        }
+      }
+    } catch (e) {
+      log('error', 'Failed to send startup message', { error: e.message });
+    }
+  }
 
   // ─── Heartbeat ───
   if (S('heartbeat_channel')) {
     let heartbeatMessage = null;
-    setInterval(async () => {
+
+    // Try to recover existing heartbeat message from settings
+    if (S('heartbeat_message_id')) {
+      try {
+        const ch = await client.channels.fetch(S('heartbeat_channel'));
+        heartbeatMessage = await ch.messages.fetch(S('heartbeat_message_id'));
+        log('info', `Resumed heartbeat message ${S('heartbeat_message_id')}`);
+      } catch (e) {
+        log('info', 'Previous heartbeat message not found, will create new one');
+        heartbeatMessage = null;
+      }
+    }
+
+    const sendHeartbeat = async () => {
       try {
         const ch = await client.channels.fetch(S('heartbeat_channel'));
         const embed = new EmbedBuilder()
@@ -432,11 +541,21 @@ client.once('ready', () => {
           await heartbeatMessage.edit({ embeds: [embed] });
         } else {
           heartbeatMessage = await ch.send({ embeds: [embed] });
+          settings.heartbeat_message_id = heartbeatMessage.id;
+          saveSettings();
+          log('info', `Created heartbeat message ${heartbeatMessage.id}`);
         }
       } catch (e) {
         log('error', 'Heartbeat failed', { error: e.message });
+        // If edit failed (e.g. message deleted), reset so next tick creates a new one
+        heartbeatMessage = null;
+        delete settings.heartbeat_message_id;
+        saveSettings();
       }
-    }, 5 * 60 * 1000);
+    };
+
+    sendHeartbeat(); // run immediately on startup
+    setInterval(sendHeartbeat, 5 * 60 * 1000);
   }
 });
 
@@ -479,10 +598,11 @@ client.on('messageCreate', async (message) => {
   const channelId = message.channel.id;
   const parentChannelId = message.channel.parentId || null;
 
-  // Channel routing
-  const isMainChannel = MAIN_CHANNEL_ID && channelId === MAIN_CHANNEL_ID;
-  const isAdminChannel = ADMIN_CHANNEL_ID && channelId === ADMIN_CHANNEL_ID;
-  const isMainThread = isThread && parentChannelId === MAIN_CHANNEL_ID;
+  // Channel routing — category-based
+  const effectiveCategoryId = isThread
+    ? (message.channel.parent?.parentId || null)
+    : message.channel.parentId;
+  const isInMyCategory = CATEGORY_ID && effectiveCategoryId === CATEGORY_ID;
 
   let prompt = message.content;
   if (isMentioned) {
@@ -490,7 +610,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ─── Bot commands — work anywhere the bot can see the message ─────
-  const cmdMatch = prompt.match(/^\/(context|compact|usage|cancel|cwd|model|app|settings|set|help)(?:\s+(.*))?$/i);
+  const cmdMatch = prompt.match(/^\/(context|compact|usage|cancel|cwd|model|app|settings|set|help|new-channel|archive-channel|stats)(?:\s+(.*))?$/i);
   if (cmdMatch) {
     const cmd = cmdMatch[1].toLowerCase();
     const cmdArg = cmdMatch[2]?.trim() || null;
@@ -516,6 +636,13 @@ client.on('messageCreate', async (message) => {
         '**Configuration**',
         '`/settings` — View all settings',
         '`/set <key> <value>` — Change a setting',
+        '',
+        '**System**',
+        '`/stats` — RAM, CPU, disk, and system info with progress bars',
+        '',
+        '**Channel Management**',
+        '`/new-channel <name> [desc]` — Create channel in my category',
+        '`/archive-channel` — Archive the current channel',
         '',
         '**Auto behaviors**',
         'Warns at **80%** thread context, auto-compacts at **90%**',
@@ -630,6 +757,89 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // ─── /stats ───
+    if (cmd === 'stats') {
+      function statBar(pct, width = 22) {
+        const filled = Math.round(Math.min(pct, 1) * width);
+        const empty = width - filled;
+        return '\u2588'.repeat(filled) + '\u2591'.repeat(empty);
+      }
+      function fmtBytes(b) {
+        if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(1)} GB`;
+        if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`;
+        if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`;
+        return `${b} B`;
+      }
+
+      // RAM
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      const memPct = usedMem / totalMem;
+      const memColor = memPct >= 0.9 ? '** CRITICAL**' : memPct >= 0.75 ? ' HIGH' : '';
+      const memText = `\`${statBar(memPct)}\` ${(memPct * 100).toFixed(1)}%${memColor}\n${fmtBytes(usedMem)} used / ${fmtBytes(totalMem)} total`;
+
+      // CPU
+      const cpus = os.cpus();
+      const coreCount = cpus.length;
+      const loadAvg = os.loadavg();
+      const cpuPct = loadAvg[0] / coreCount;
+      const cpuLabel = cpuPct >= 0.9 ? ' HIGH' : '';
+      const cpuModel = cpus[0]?.model?.replace(/\s+/g, ' ').trim() || 'Unknown';
+      const cpuText = `\`${statBar(cpuPct)}\` ${(cpuPct * 100).toFixed(1)}%${cpuLabel}\nLoad avg: ${loadAvg[0].toFixed(2)} / ${loadAvg[1].toFixed(2)} / ${loadAvg[2].toFixed(2)}\n${coreCount} cores — ${cpuModel}`;
+
+      // Disk
+      const diskFields = [];
+      try {
+        const dfOut = execSync('df -B1 --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs -x squashfs 2>/dev/null', { encoding: 'utf8' });
+        const dfLines = dfOut.trim().split('\n').slice(1);
+        for (const line of dfLines) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length < 6) continue;
+          const [, sizeB, usedB, availB, pctStr, mnt] = parts;
+          const pct = parseInt(pctStr) / 100;
+          const diskLabel = pct >= 0.9 ? ' CRITICAL' : pct >= 0.75 ? ' HIGH' : '';
+          diskFields.push({
+            name: `Disk: ${mnt}`,
+            value: `\`${statBar(pct)}\` ${pctStr}${diskLabel}\n${fmtBytes(parseInt(usedB))} used / ${fmtBytes(parseInt(sizeB))} total (${fmtBytes(parseInt(availB))} free)`,
+            inline: false,
+          });
+        }
+      } catch (_) {}
+
+      // Uptime
+      const uptSec = os.uptime();
+      const uptD = Math.floor(uptSec / 86400);
+      const uptH = Math.floor((uptSec % 86400) / 3600);
+      const uptM = Math.floor((uptSec % 3600) / 60);
+      const uptStr = uptD > 0 ? `${uptD}d ${uptH}h ${uptM}m` : `${uptH}h ${uptM}m`;
+
+      // Network interfaces (non-internal IPv4)
+      const nets = os.networkInterfaces();
+      const netLines = [];
+      for (const [iface, addrs] of Object.entries(nets)) {
+        for (const a of addrs) {
+          if (!a.internal && a.family === 'IPv4') netLines.push(`${iface}: ${a.address}`);
+        }
+      }
+
+      const statsEmbed = new EmbedBuilder()
+        .setColor(COLOR_INFO)
+        .setTitle('System Stats')
+        .addFields(
+          { name: 'RAM', value: memText, inline: false },
+          { name: `CPU (${coreCount} cores)`, value: cpuText, inline: false },
+          ...diskFields,
+        );
+      if (netLines.length) statsEmbed.addFields({ name: 'Network', value: netLines.join('\n'), inline: false });
+      statsEmbed
+        .setFooter({ text: `Uptime: ${uptStr}  |  Host: ${os.hostname()}` })
+        .setTimestamp();
+
+      await message.reply({ embeds: [statsEmbed] });
+      return;
+    }
+
     // ─── /compact ───
     if (cmd === 'compact') {
       if (!threadId || !getSessionId(threadId)) {
@@ -667,13 +877,24 @@ client.on('messageCreate', async (message) => {
 
     // ─── /cwd ───
     if (cmd === 'cwd') {
-      if (!threadId) {
-        await message.reply('Use /cwd inside a thread.');
+      const cwdKey = threadId || channelId;
+      if (!cmdArg) {
+        // Report cwd — try session, then match channel name to app, then HOME_DIR
+        let current = sessions[cwdKey]?.cwd;
+        if (!current) {
+          const chanName = message.channel.name || '';
+          const appPath = path.join(APPS_DIR, chanName);
+          if (fs.existsSync(appPath)) {
+            current = appPath;
+          } else {
+            current = HOME_DIR;
+          }
+        }
+        await message.reply(`Current working directory: \`${current}\``);
         return;
       }
-      if (!cmdArg) {
-        const current = sessions[threadId]?.cwd || HOME_DIR;
-        await message.reply(`Current working directory: \`${current}\``);
+      if (!threadId) {
+        await message.reply('Use /cwd <path> inside a thread to set the working directory.');
         return;
       }
       const targetPath = cmdArg;
@@ -846,20 +1067,58 @@ client.on('messageCreate', async (message) => {
       });
       return;
     }
-  }
 
-  // ─── Claude interaction gate — only in allowed channels ────────────
-  // Commands (above) work anywhere. Actual Claude spawning is restricted.
-  if (MAIN_CHANNEL_ID || ADMIN_CHANNEL_ID) {
-    // Channels configured: only main channel, its threads, and DMs can spawn Claude
-    if (!isDM && !isMainChannel && !isMainThread) {
-      if (isAdminChannel) {
-        await message.reply('This channel is for bot commands only. Use the main channel to talk to Claude.');
+    // ─── /new-channel ───
+    if (cmd === 'new-channel') {
+      if (!CATEGORY_ID) { await message.reply('No category configured.'); return; }
+      if (!cmdArg) { await message.reply('Usage: `/new-channel <name> [description]`'); return; }
+      const ncParts = cmdArg.split(' ');
+      const channelName = ncParts[0];
+      const topic = ncParts.slice(1).join(' ') || null;
+      try {
+        const guild = message.guild || client.guilds.cache.get(GUILD_ID);
+        const newCh = await createChannelInCategory(guild, channelName, topic);
+        await message.reply({
+          embeds: [new EmbedBuilder().setColor(COLOR_SUCCESS).setTitle('Channel created')
+            .setDescription(`<#${newCh.id}>${topic ? `\n> ${topic}` : ''}`)]
+        });
+      } catch (e) {
+        await message.reply(`Failed: ${e.message}`);
       }
       return;
     }
+
+    // ─── /archive-channel ───
+    if (cmd === 'archive-channel') {
+      const targetCh = isThread ? message.channel.parent : message.channel;
+      if (!targetCh || targetCh.parentId !== CATEGORY_ID) {
+        await message.reply('Use this inside a channel in my category.');
+        return;
+      }
+      if (UTILITY_CHANNELS.has(targetCh.name)) {
+        await message.reply('Cannot archive a core channel.');
+        return;
+      }
+      try {
+        const newName = `archive-${targetCh.name}`;
+        await targetCh.setName(newName);
+        await targetCh.setPosition(999);
+        await message.reply({
+          embeds: [new EmbedBuilder().setColor(COLOR_SUCCESS).setTitle('Channel archived')
+            .setDescription(`Renamed to \`${newName}\``)]
+        });
+      } catch (e) {
+        await message.reply(`Failed: ${e.message}`);
+      }
+      return;
+    }
+  }
+
+  // ─── Claude interaction gate — only in my category or DMs ──────────
+  if (CATEGORY_ID) {
+    if (!isDM && !isInMyCategory) return;
   } else {
-    // No channels configured: fall back to mention/thread/DM behavior
+    // Fallback: mention/thread/DM only
     if (!isDM && !isMentioned && !isThread) return;
   }
 
@@ -894,12 +1153,39 @@ client.on('messageCreate', async (message) => {
   let isNewThread = false;
 
   if (!isDM && !isThread) {
+    // ─── Smart routing: redirect to best channel if needed ───────────
+    let targetChannel = message.channel;
+    if (CATEGORY_ID && message.guild) {
+      const suggestedChannel = await findBestChannel(message.guild, prompt, message.channel.id);
+      if (suggestedChannel) {
+        try {
+          await message.reply({
+            embeds: [new EmbedBuilder()
+              .setColor(COLOR_INFO)
+              .setDescription(`➜ <#${suggestedChannel.id}>`)]
+          });
+          targetChannel = suggestedChannel;
+        } catch (e) {
+          log('error', 'Failed to post routing notice', { error: e.message });
+        }
+      }
+    }
+
     try {
       const threadName = prompt.substring(0, 95) + (prompt.length > 95 ? '...' : '');
-      const thread = await message.startThread({
-        name: threadName,
-        autoArchiveDuration: 1440,
-      });
+      let thread;
+      if (targetChannel.id === message.channel.id) {
+        // Same channel — anchor thread to the user's message
+        thread = await message.startThread({ name: threadName, autoArchiveDuration: 1440 });
+      } else {
+        // Different channel — send bridge message then thread
+        const bridge = await targetChannel.send({
+          embeds: [new EmbedBuilder()
+            .setColor(COLOR_INFO)
+            .setDescription(`↩ from <#${message.channel.id}>\n**${message.author.displayName || message.author.username}:** ${prompt.substring(0, 300)}${prompt.length > 300 ? '…' : ''}`)]
+        });
+        thread = await bridge.startThread({ name: threadName, autoArchiveDuration: 1440 });
+      }
       responseChannel = thread;
       threadId = thread.id;
       isNewThread = true;
@@ -986,15 +1272,47 @@ client.on('messageCreate', async (message) => {
     const sessionCwd = threadId ? sessions[threadId]?.cwd : null;
     const sessionModel = (threadId ? sessions[threadId]?.model : null) || (S('default_model') !== 'opus' ? S('default_model') : null);
 
+    // ─── Auto-detect project context from channel name ────────────────
+    let resolvedCwd = sessionCwd;
+    let channelContextNote = '';
+    {
+      // Determine the parent channel (works for both threads and direct channel messages)
+      const parentChan = responseChannel.parent || responseChannel;
+      const chanName = (parentChan.name || '').replace(/^archive-/, '');
+      const chanTopic = parentChan.topic || '';
+
+      // Auto-set cwd if channel name matches an app directory and no cwd is set yet
+      if (!resolvedCwd && chanName && !UTILITY_CHANNELS.has(chanName)) {
+        const appPath = path.join(APPS_DIR, chanName);
+        if (fs.existsSync(appPath)) {
+          resolvedCwd = appPath;
+          // Persist so subsequent messages in this thread inherit it
+          if (threadId) {
+            if (!sessions[threadId]) sessions[threadId] = { sessionId: null, usage: null };
+            sessions[threadId].cwd = appPath;
+            saveSessions();
+          }
+        }
+      }
+
+      // Inject channel/project context for new sessions only (not resuming)
+      if (!existingSession && chanName && !UTILITY_CHANNELS.has(chanName)) {
+        const cwdLine = resolvedCwd && resolvedCwd !== HOME_DIR
+          ? `\nWorking directory automatically set to: ${resolvedCwd}` : '';
+        const topicLine = chanTopic ? `\nChannel topic: ${chanTopic}` : '';
+        channelContextNote = `[CONTEXT: You are in the #${chanName} Discord channel.${topicLine}${cwdLine}]\n\n`;
+      }
+    }
+
     // Inject context warning into prompt when resuming high-usage sessions
-    let augmentedPrompt = prompt;
+    let augmentedPrompt = channelContextNote + prompt;
     if (existingUsage?.percent >= S('context_warn')) {
-      augmentedPrompt = `[SYSTEM NOTE: Context usage is at ${(existingUsage.percent * 100).toFixed(1)}% of the ${formatTokens(existingUsage.contextWindow || 1000000)} window. Be extra concise. Avoid spawning new Agent sub-processes unless absolutely necessary. If the user's request would require heavy context (reading many files, multi-agent work), suggest running /compact first.]\n\n${prompt}`;
+      augmentedPrompt = `[SYSTEM NOTE: Context usage is at ${(existingUsage.percent * 100).toFixed(1)}% of the ${formatTokens(existingUsage.contextWindow || 1000000)} window. Be extra concise. Avoid spawning new Agent sub-processes unless absolutely necessary. If the user's request would require heavy context (reading many files, multi-agent work), suggest running /compact first.]\n\n${augmentedPrompt}`;
     }
 
     const { finalText, sessionId, images, usage } = await enqueueOrRun(
       augmentedPrompt, existingSession, responseChannel,
-      { threadId, cwd: sessionCwd, model: sessionModel, existingContextPercent: existingUsage?.percent || 0 }
+      { threadId, cwd: resolvedCwd || HOME_DIR, model: sessionModel, existingContextPercent: existingUsage?.percent || 0 }
     );
 
     if (threadId && sessionId) {

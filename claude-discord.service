@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tom
+Group=tom
+WorkingDirectory=/home/tom/discord-bot
+ExecStart=/usr/bin/node /home/tom/discord-bot/bot.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/home/tom
+Environment=PATH=/home/tom/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
